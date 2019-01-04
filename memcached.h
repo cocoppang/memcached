@@ -205,7 +205,8 @@ enum bin_substates {
 enum protocol {
     ascii_prot = 3, /* arbitrary value. */
     binary_prot,
-    negotiating_prot /* Discovering the protocol */
+    negotiating_prot, /* Discovering the protocol */
+	local_file_prot /** Local file read/write protocol **/
 };
 
 enum network_transport {
@@ -220,6 +221,8 @@ enum pause_thread_types {
     RESUME_ALL_THREADS,
     RESUME_WORKER_THREADS
 };
+
+#define IS_FILE_PROTOCOL(x) (x == local_file_prot)
 
 #define IS_TCP(x) (x == tcp_transport)
 #define IS_UDP(x) (x == udp_transport)
@@ -609,6 +612,11 @@ struct conn {
 
     char   *ritem;  /** when we read in an item's value, it goes here */
     int    rlbytes;
+
+
+	/** For local file experiments **/
+	char ***inst;
+	int *cur_inst_count;
 
     /* data for the nread state */
 

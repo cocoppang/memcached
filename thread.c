@@ -326,15 +326,21 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         exit(1);
     }
 
-    /* Listen for notifications from other threads */
-    event_set(&me->notify_event, me->notify_receive_fd,
-              EV_READ | EV_PERSIST, thread_libevent_process, me);
-    event_base_set(me->base, &me->notify_event);
+	if(settings.binding_protocol != local_file_prot) {
 
-    if (event_add(&me->notify_event, 0) == -1) {
-        fprintf(stderr, "Can't monitor libevent notify pipe\n");
-        exit(1);
-    }
+		/* Listen for notifications from other threads */
+		event_set(&me->notify_event, me->notify_receive_fd,
+				EV_READ | EV_PERSIST, thread_libevent_process, me);
+		event_base_set(me->base, &me->notify_event);
+
+		if (event_add(&me->notify_event, 0) == -1) {
+			fprintf(stderr, "Can't monitor libevent notify pipe\n");
+			exit(1);
+		}
+	}
+	else {
+		//TODO : Should initialize thread
+	}
 
     me->new_conn_queue = malloc(sizeof(struct conn_queue));
     if (me->new_conn_queue == NULL) {

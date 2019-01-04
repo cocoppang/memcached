@@ -83,6 +83,7 @@ enum try_read_result {
 
 static enum try_read_result try_read_network(conn *c);
 static enum try_read_result try_read_udp(conn *c);
+static enum try_read_result try_read_file(conn *c);
 
 static void conn_set_state(conn *c, enum conn_states state);
 static int start_conn_timeout_thread();
@@ -454,6 +455,9 @@ static const char *prot_text(enum protocol prot) {
         case negotiating_prot:
             rv = "auto-negotiate";
             break;
+        case local_file_prot:
+            rv = "file";
+            break;
     }
     return rv;
 }
@@ -591,6 +595,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             fprintf(stderr, "<%d new ascii client connection.\n", sfd);
         } else if (c->protocol == binary_prot) {
             fprintf(stderr, "<%d new binary client connection.\n", sfd);
+        } else if (c->protocol == local_file_prot) {
+            fprintf(stderr, "<%d new local file connection.\n", sfd);
         } else {
             fprintf(stderr, "<%d new unknown (%d) client connection\n",
                 sfd, c->protocol);
@@ -626,14 +632,16 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->noreply = false;
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
+	if(c->protocol != local_file_prot) {
+		event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
+		event_base_set(base, &c->event);
+		c->ev_flags = event_flags;
 
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-        return NULL;
-    }
+		if (event_add(&c->event, 0) == -1) {
+			perror("event_add");
+			return NULL;
+		}
+	}
 
     STATS_LOCK();
     stats_state.curr_conns++;
@@ -1148,6 +1156,35 @@ static void out_of_memory(conn *c, char *ascii_error) {
     }
 }
 
+
+static void complete_nread_file(conn *c) {
+	item *it = c->item;
+	int comm = c->cmd;
+    enum store_item_type ret;
+
+	ret = store_item(it, comm, c);
+
+    switch (ret) {
+    case STORED:
+        out_string(c, "STORED");
+        break;
+    case EXISTS:
+        out_string(c, "EXISTS");
+        break;
+    case NOT_FOUND:
+        out_string(c, "NOT_FOUND");
+        break;
+    case NOT_STORED:
+        out_string(c, "NOT_STORED");
+        break;
+    default:
+        out_string(c, "SERVER_ERROR Unhandled storage type.");
+    }
+
+    item_remove(c->item);       /* release the c->item reference */
+    c->item = 0;
+
+}
 /*
  * we get here after reading the value in set/add/replace commands. The command
  * has been stored in c->cmd, and the item is ready in c->item.
@@ -2712,6 +2749,9 @@ static void complete_nread(conn *c) {
     } else if (c->protocol == binary_prot) {
         complete_nread_binary(c);
     }
+	else if(c->protocol == local_file_prot) {
+		complete_nread_file(c);
+	}
 }
 
 /* Destination must always be chunked */
@@ -4030,12 +4070,21 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     key = tokens[KEY_TOKEN].value;
     nkey = tokens[KEY_TOKEN].length;
 
-    if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
-           && safe_strtol(tokens[3].value, &exptime_int)
-           && safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
-        out_string(c, "CLIENT_ERROR bad command line format");
-        return;
-    }
+	if(c->protocol != local_file_prot) {
+		if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
+					&& safe_strtol(tokens[3].value, &exptime_int)
+					&& safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
+			out_string(c, "CLIENT_ERROR bad command line format");
+			return;
+		}
+	}
+	else {
+		//set default value 
+		exptime_int = 60;
+		flags = 0;
+		//TODO value length
+		vlen = 16;
+	}
 
     /* Ubuntu 8.04 breaks when I pass exptime to safe_strtol */
     exptime = exptime_int;
@@ -4048,6 +4097,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
     // does cas value exist?
     if (handle_cas) {
+
+		//do not enter this code
+		assert(0);
+
         if (!safe_strtoull(tokens[5].value, &req_cas_id)) {
             out_string(c, "CLIENT_ERROR bad command line format");
             return;
@@ -4108,7 +4161,13 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 #endif
     c->rlbytes = it->nbytes;
     c->cmd = comm;
+
+
+	//just set the value to ritem (do not process unnecessary codes)
+	memmove(c->ritem, tokens[2].value, tokens[2].length);
+	c->rlbytes = 0;
     conn_set_state(c, conn_nread);
+
 }
 
 static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -4624,6 +4683,8 @@ static void process_extstore_command(conn *c, token_t *tokens, const size_t ntok
     }
 }
 #endif
+
+/** Processing Commands **/
 static void process_command(conn *c, char *command) {
 
     token_t tokens[MAX_TOKENS];
@@ -4651,291 +4712,303 @@ static void process_command(conn *c, char *command) {
     }
 
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
-    if (ntokens >= 3 &&
-        ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
-         (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
 
-        process_get_command(c, tokens, ntokens, false, false);
+	if(c->protocol == local_file_prot) {
+		if(strcmp(tokens[COMMAND_TOKEN].value, "GET") == 0) {
+			process_get_command(c, tokens, ntokens, false, false);
+		}
+		else if(strcmp(tokens[COMMAND_TOKEN].value, "SET") == 0) {
+			process_update_command(c, tokens, ntokens, NREAD_SET, false);
+		}
+	}
+	else {
+		if (ntokens >= 3 &&
+				((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
+				 (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
 
-    } else if ((ntokens == 6 || ntokens == 7) &&
-               ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
+			process_get_command(c, tokens, ntokens, false, false);
 
-        process_update_command(c, tokens, ntokens, comm, false);
+		} else if ((ntokens == 6 || ntokens == 7) &&
+				((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
+				 (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
+				 (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
+				 (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
+				 (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
 
-    } else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
+			process_update_command(c, tokens, ntokens, comm, false);
 
-        process_update_command(c, tokens, ntokens, comm, true);
+		} else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
 
-    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
+			process_update_command(c, tokens, ntokens, comm, true);
 
-        process_arithmetic_command(c, tokens, ntokens, 1);
+		} else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
 
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
+			process_arithmetic_command(c, tokens, ntokens, 1);
 
-        process_get_command(c, tokens, ntokens, true, false);
+		} else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
 
-    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
+			process_get_command(c, tokens, ntokens, true, false);
 
-        process_arithmetic_command(c, tokens, ntokens, 0);
+		} else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
 
-    } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
+			process_arithmetic_command(c, tokens, ntokens, 0);
 
-        process_delete_command(c, tokens, ntokens);
+		} else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
 
-    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "touch") == 0)) {
+			process_delete_command(c, tokens, ntokens);
 
-        process_touch_command(c, tokens, ntokens);
+		} else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "touch") == 0)) {
 
-    } else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gat") == 0)) {
+			process_touch_command(c, tokens, ntokens);
 
-        process_get_command(c, tokens, ntokens, false, true);
+		} else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gat") == 0)) {
 
-    } else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gats") == 0)) {
+			process_get_command(c, tokens, ntokens, false, true);
 
-        process_get_command(c, tokens, ntokens, true, true);
+		} else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gats") == 0)) {
 
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
+			process_get_command(c, tokens, ntokens, true, true);
 
-        process_stat(c, tokens, ntokens);
+		} else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
 
-    } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
-        time_t exptime = 0;
-        rel_time_t new_oldest = 0;
+			process_stat(c, tokens, ntokens);
 
-        set_noreply_maybe(c, tokens, ntokens);
+		} else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
+			time_t exptime = 0;
+			rel_time_t new_oldest = 0;
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.flush_cmds++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+			set_noreply_maybe(c, tokens, ntokens);
 
-        if (!settings.flush_enabled) {
-            // flush_all is not allowed but we log it on stats
-            out_string(c, "CLIENT_ERROR flush_all not allowed");
-            return;
-        }
+			pthread_mutex_lock(&c->thread->stats.mutex);
+			c->thread->stats.flush_cmds++;
+			pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        if (ntokens != (c->noreply ? 3 : 2)) {
-            exptime = strtol(tokens[1].value, NULL, 10);
-            if(errno == ERANGE) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
-        }
+			if (!settings.flush_enabled) {
+				// flush_all is not allowed but we log it on stats
+				out_string(c, "CLIENT_ERROR flush_all not allowed");
+				return;
+			}
 
-        /*
-          If exptime is zero realtime() would return zero too, and
-          realtime(exptime) - 1 would overflow to the max unsigned
-          value.  So we process exptime == 0 the same way we do when
-          no delay is given at all.
-        */
-        if (exptime > 0) {
-            new_oldest = realtime(exptime);
-        } else { /* exptime == 0 */
-            new_oldest = current_time;
-        }
+			if (ntokens != (c->noreply ? 3 : 2)) {
+				exptime = strtol(tokens[1].value, NULL, 10);
+				if(errno == ERANGE) {
+					out_string(c, "CLIENT_ERROR bad command line format");
+					return;
+				}
+			}
 
-        if (settings.use_cas) {
-            settings.oldest_live = new_oldest - 1;
-            if (settings.oldest_live <= current_time)
-                settings.oldest_cas = get_cas_id();
-        } else {
-            settings.oldest_live = new_oldest;
-        }
-        out_string(c, "OK");
-        return;
+			/*
+			   If exptime is zero realtime() would return zero too, and
+			   realtime(exptime) - 1 would overflow to the max unsigned
+			   value.  So we process exptime == 0 the same way we do when
+			   no delay is given at all.
+			   */
+			if (exptime > 0) {
+				new_oldest = realtime(exptime);
+			} else { /* exptime == 0 */
+				new_oldest = current_time;
+			}
 
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
+			if (settings.use_cas) {
+				settings.oldest_live = new_oldest - 1;
+				if (settings.oldest_live <= current_time)
+					settings.oldest_cas = get_cas_id();
+			} else {
+				settings.oldest_live = new_oldest;
+			}
+			out_string(c, "OK");
+			return;
 
-        out_string(c, "VERSION " VERSION);
+		} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
 
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
+			out_string(c, "VERSION " VERSION);
 
-        conn_set_state(c, conn_closing);
+		} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
 
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0)) {
+			conn_set_state(c, conn_closing);
 
-        if (settings.shutdown_command) {
-            conn_set_state(c, conn_closing);
-            raise(SIGINT);
-        } else {
-            out_string(c, "ERROR: shutdown not enabled");
-        }
+		} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0)) {
 
-    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
-        if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
-            int src, dst, rv;
+			if (settings.shutdown_command) {
+				conn_set_state(c, conn_closing);
+				raise(SIGINT);
+			} else {
+				out_string(c, "ERROR: shutdown not enabled");
+			}
 
-            if (settings.slab_reassign == false) {
-                out_string(c, "CLIENT_ERROR slab reassignment disabled");
-                return;
-            }
+		} else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
+			if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
+				int src, dst, rv;
 
-            src = strtol(tokens[2].value, NULL, 10);
-            dst = strtol(tokens[3].value, NULL, 10);
+				if (settings.slab_reassign == false) {
+					out_string(c, "CLIENT_ERROR slab reassignment disabled");
+					return;
+				}
 
-            if (errno == ERANGE) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
+				src = strtol(tokens[2].value, NULL, 10);
+				dst = strtol(tokens[3].value, NULL, 10);
 
-            rv = slabs_reassign(src, dst);
-            switch (rv) {
-            case REASSIGN_OK:
-                out_string(c, "OK");
-                break;
-            case REASSIGN_RUNNING:
-                out_string(c, "BUSY currently processing reassign request");
-                break;
-            case REASSIGN_BADCLASS:
-                out_string(c, "BADCLASS invalid src or dst class id");
-                break;
-            case REASSIGN_NOSPARE:
-                out_string(c, "NOSPARE source class has no spare pages");
-                break;
-            case REASSIGN_SRC_DST_SAME:
-                out_string(c, "SAME src and dst class are identical");
-                break;
-            }
-            return;
-        } else if (ntokens >= 4 &&
-            (strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
-            process_slabs_automove_command(c, tokens, ntokens);
-        } else {
-            out_string(c, "ERROR");
-        }
-    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "lru_crawler") == 0) {
-        if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "crawl") == 0) {
-            int rv;
-            if (settings.lru_crawler == false) {
-                out_string(c, "CLIENT_ERROR lru crawler disabled");
-                return;
-            }
+				if (errno == ERANGE) {
+					out_string(c, "CLIENT_ERROR bad command line format");
+					return;
+				}
 
-            rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL, 0,
-                    settings.lru_crawler_tocrawl);
-            switch(rv) {
-            case CRAWLER_OK:
-                out_string(c, "OK");
-                break;
-            case CRAWLER_RUNNING:
-                out_string(c, "BUSY currently processing crawler request");
-                break;
-            case CRAWLER_BADCLASS:
-                out_string(c, "BADCLASS invalid class id");
-                break;
-            case CRAWLER_NOTSTARTED:
-                out_string(c, "NOTSTARTED no items to crawl");
-                break;
-            case CRAWLER_ERROR:
-                out_string(c, "ERROR an unknown error happened");
-                break;
-            }
-            return;
-        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "metadump") == 0) {
-            if (settings.lru_crawler == false) {
-                out_string(c, "CLIENT_ERROR lru crawler disabled");
-                return;
-            }
-            if (!settings.dump_enabled) {
-                out_string(c, "ERROR metadump not allowed");
-                return;
-            }
+				rv = slabs_reassign(src, dst);
+				switch (rv) {
+					case REASSIGN_OK:
+						out_string(c, "OK");
+						break;
+					case REASSIGN_RUNNING:
+						out_string(c, "BUSY currently processing reassign request");
+						break;
+					case REASSIGN_BADCLASS:
+						out_string(c, "BADCLASS invalid src or dst class id");
+						break;
+					case REASSIGN_NOSPARE:
+						out_string(c, "NOSPARE source class has no spare pages");
+						break;
+					case REASSIGN_SRC_DST_SAME:
+						out_string(c, "SAME src and dst class are identical");
+						break;
+				}
+				return;
+			} else if (ntokens >= 4 &&
+					(strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
+				process_slabs_automove_command(c, tokens, ntokens);
+			} else {
+				out_string(c, "ERROR");
+			}
+		} else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "lru_crawler") == 0) {
+			if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "crawl") == 0) {
+				int rv;
+				if (settings.lru_crawler == false) {
+					out_string(c, "CLIENT_ERROR lru crawler disabled");
+					return;
+				}
 
-            int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
-                    c, c->sfd, LRU_CRAWLER_CAP_REMAINING);
-            switch(rv) {
-                case CRAWLER_OK:
-                    out_string(c, "OK");
-                    // TODO: Don't reuse conn_watch here.
-                    conn_set_state(c, conn_watch);
-                    event_del(&c->event);
-                    break;
-                case CRAWLER_RUNNING:
-                    out_string(c, "BUSY currently processing crawler request");
-                    break;
-                case CRAWLER_BADCLASS:
-                    out_string(c, "BADCLASS invalid class id");
-                    break;
-                case CRAWLER_NOTSTARTED:
-                    out_string(c, "NOTSTARTED no items to crawl");
-                    break;
-                case CRAWLER_ERROR:
-                    out_string(c, "ERROR an unknown error happened");
-                    break;
-            }
-            return;
-        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "tocrawl") == 0) {
-            uint32_t tocrawl;
-             if (!safe_strtoul(tokens[2].value, &tocrawl)) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
-            settings.lru_crawler_tocrawl = tocrawl;
-            out_string(c, "OK");
-            return;
-        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "sleep") == 0) {
-            uint32_t tosleep;
-            if (!safe_strtoul(tokens[2].value, &tosleep)) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
-            if (tosleep > 1000000) {
-                out_string(c, "CLIENT_ERROR sleep must be one second or less");
-                return;
-            }
-            settings.lru_crawler_sleep = tosleep;
-            out_string(c, "OK");
-            return;
-        } else if (ntokens == 3) {
-            if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "enable") == 0)) {
-                if (start_item_crawler_thread() == 0) {
-                    out_string(c, "OK");
-                } else {
-                    out_string(c, "ERROR failed to start lru crawler thread");
-                }
-            } else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
-                if (stop_item_crawler_thread() == 0) {
-                    out_string(c, "OK");
-                } else {
-                    out_string(c, "ERROR failed to stop lru crawler thread");
-                }
-            } else {
-                out_string(c, "ERROR");
-            }
-            return;
-        } else {
-            out_string(c, "ERROR");
-        }
-    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "watch") == 0) {
-        process_watch_command(c, tokens, ntokens);
-    } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "cache_memlimit") == 0)) {
-        process_memlimit_command(c, tokens, ntokens);
-    } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
-        process_verbosity_command(c, tokens, ntokens);
-    } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "lru") == 0) {
-        process_lru_command(c, tokens, ntokens);
+				rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL, 0,
+						settings.lru_crawler_tocrawl);
+				switch(rv) {
+					case CRAWLER_OK:
+						out_string(c, "OK");
+						break;
+					case CRAWLER_RUNNING:
+						out_string(c, "BUSY currently processing crawler request");
+						break;
+					case CRAWLER_BADCLASS:
+						out_string(c, "BADCLASS invalid class id");
+						break;
+					case CRAWLER_NOTSTARTED:
+						out_string(c, "NOTSTARTED no items to crawl");
+						break;
+					case CRAWLER_ERROR:
+						out_string(c, "ERROR an unknown error happened");
+						break;
+				}
+				return;
+			} else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "metadump") == 0) {
+				if (settings.lru_crawler == false) {
+					out_string(c, "CLIENT_ERROR lru crawler disabled");
+					return;
+				}
+				if (!settings.dump_enabled) {
+					out_string(c, "ERROR metadump not allowed");
+					return;
+				}
+
+				int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
+						c, c->sfd, LRU_CRAWLER_CAP_REMAINING);
+				switch(rv) {
+					case CRAWLER_OK:
+						out_string(c, "OK");
+						// TODO: Don't reuse conn_watch here.
+						conn_set_state(c, conn_watch);
+						event_del(&c->event);
+						break;
+					case CRAWLER_RUNNING:
+						out_string(c, "BUSY currently processing crawler request");
+						break;
+					case CRAWLER_BADCLASS:
+						out_string(c, "BADCLASS invalid class id");
+						break;
+					case CRAWLER_NOTSTARTED:
+						out_string(c, "NOTSTARTED no items to crawl");
+						break;
+					case CRAWLER_ERROR:
+						out_string(c, "ERROR an unknown error happened");
+						break;
+				}
+				return;
+			} else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "tocrawl") == 0) {
+				uint32_t tocrawl;
+				if (!safe_strtoul(tokens[2].value, &tocrawl)) {
+					out_string(c, "CLIENT_ERROR bad command line format");
+					return;
+				}
+				settings.lru_crawler_tocrawl = tocrawl;
+				out_string(c, "OK");
+				return;
+			} else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "sleep") == 0) {
+				uint32_t tosleep;
+				if (!safe_strtoul(tokens[2].value, &tosleep)) {
+					out_string(c, "CLIENT_ERROR bad command line format");
+					return;
+				}
+				if (tosleep > 1000000) {
+					out_string(c, "CLIENT_ERROR sleep must be one second or less");
+					return;
+				}
+				settings.lru_crawler_sleep = tosleep;
+				out_string(c, "OK");
+				return;
+			} else if (ntokens == 3) {
+				if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "enable") == 0)) {
+					if (start_item_crawler_thread() == 0) {
+						out_string(c, "OK");
+					} else {
+						out_string(c, "ERROR failed to start lru crawler thread");
+					}
+				} else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
+					if (stop_item_crawler_thread() == 0) {
+						out_string(c, "OK");
+					} else {
+						out_string(c, "ERROR failed to stop lru crawler thread");
+					}
+				} else {
+					out_string(c, "ERROR");
+				}
+				return;
+			} else {
+				out_string(c, "ERROR");
+			}
+		} else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "watch") == 0) {
+			process_watch_command(c, tokens, ntokens);
+		} else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "cache_memlimit") == 0)) {
+			process_memlimit_command(c, tokens, ntokens);
+		} else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
+			process_verbosity_command(c, tokens, ntokens);
+		} else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "lru") == 0) {
+			process_lru_command(c, tokens, ntokens);
 #ifdef MEMCACHED_DEBUG
-    // commands which exist only for testing the memcached's security protection
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "misbehave") == 0)) {
-        process_misbehave_command(c);
+			// commands which exist only for testing the memcached's security protection
+		} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "misbehave") == 0)) {
+			process_misbehave_command(c);
 #endif
 #ifdef EXTSTORE
-    } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "extstore") == 0) {
-        process_extstore_command(c, tokens, ntokens);
+		} else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "extstore") == 0) {
+			process_extstore_command(c, tokens, ntokens);
 #endif
-    } else {
-        if (ntokens >= 2 && strncmp(tokens[ntokens - 2].value, "HTTP/", 5) == 0) {
-            conn_set_state(c, conn_closing);
-        } else {
-            out_string(c, "ERROR");
-        }
-    }
+		} else {
+			if (ntokens >= 2 && strncmp(tokens[ntokens - 2].value, "HTTP/", 5) == 0) {
+				conn_set_state(c, conn_closing);
+			} else {
+				out_string(c, "ERROR");
+			}
+		}
+	}
     return;
 }
+
 
 /*
  * if we have a complete line in the buffer, process it.
@@ -4951,12 +5024,13 @@ static int try_read_command(conn *c) {
         } else {
             c->protocol = ascii_prot;
         }
-
-        if (settings.verbose > 1) {
-            fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
-                    prot_text(c->protocol));
-        }
     }
+
+	/** Verbose for all the protocols **/
+	if (settings.verbose > 1) {
+		fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
+				prot_text(c->protocol));
+	}
 
     if (c->protocol == binary_prot) {
         /* Do we have the complete packet header? */
@@ -5024,7 +5098,17 @@ static int try_read_command(conn *c) {
             c->rbytes -= sizeof(c->binary_header);
             c->rcurr += sizeof(c->binary_header);
         }
-    } else {
+    } 
+	else if (c->protocol == local_file_prot) {
+		//process commands
+		//process_command(c, c->inst[c->thread->thread_id][c->cur_inst_count[c->thread->thread_id]]);
+		if(c->cur_inst_count[0] == 500) {
+			return -1;
+		}
+		process_command(c, c->inst[0][c->cur_inst_count[0]]);
+		c->cur_inst_count[0]++;
+	}
+	else {
         char *el, *cont;
 
         if (c->rbytes == 0)
@@ -5070,6 +5154,59 @@ static int try_read_command(conn *c) {
     }
 
     return 1;
+}
+
+
+/** Read all the input file like shieldstore front-hand **/
+#define BUF_SIZE 64
+static enum try_read_result try_read_file(conn *c) {
+	int i,j;
+
+	char *tok;
+	char *temp_;
+	char buf[BUF_SIZE];
+	char buf2[BUF_SIZE];
+	char key[16];
+	FILE *f;
+	int thread_id;
+
+	int set_size = 500;
+    
+	assert(c != NULL);
+	
+	c->inst = (char***)malloc(sizeof(char**)*settings.num_threads);
+	c->cur_inst_count = (int*)malloc(sizeof(int)*settings.num_threads);
+
+	for(i = 0; i < settings.num_threads;i++) {
+		c->cur_inst_count[i] = 0;
+		c->inst[i] = (char**)malloc(sizeof(char*)*set_size);
+		for(j = 0; j < set_size;j++) {
+			c->inst[i][j] = (char*)malloc(sizeof(char)*BUF_SIZE);
+		}
+	}
+
+	if(c->inst == NULL || c->cur_inst_count == NULL) 
+		return READ_MEMORY_ERROR;
+
+	f = fdopen(c->sfd, "r");
+	i = 0;
+	while(i < set_size) {
+		if(fgets(buf, BUF_SIZE, f) == NULL) {
+			return READ_NO_DATA_RECEIVED;
+		}
+		buf[strlen(buf)-1] = 0;
+		memcpy(buf2, buf, BUF_SIZE);
+		tok = strtok_r(buf+4," ",&temp_);
+		memset(key, 0, 16);
+		memcpy(key, tok, strlen(tok));
+
+		//single thread
+		thread_id = 0;
+		memcpy(c->inst[thread_id][i++], buf2, BUF_SIZE);
+		
+	}
+
+	return READ_DATA_RECEIVED;
 }
 
 /*
@@ -5476,15 +5613,17 @@ static void drive_machine(conn *c) {
             conn_set_state(c, conn_read);
             stop = true;
             break;
-
+		
+		/** Here we can fetch the file to the memory instead of fetching request from clients **/
         case conn_read:
-            res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
+            res = IS_FILE_PROTOCOL(c->protocol) ? try_read_file(c) : (IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c));
 
             switch (res) {
             case READ_NO_DATA_RECEIVED:
                 conn_set_state(c, conn_waiting);
                 break;
             case READ_DATA_RECEIVED:
+				/** correctly received data from client or file **/
                 conn_set_state(c, conn_parse_cmd);
                 break;
             case READ_ERROR:
@@ -5497,10 +5636,15 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_parse_cmd :
-            if (try_read_command(c) == 0) {
+			res = try_read_command(c);
+            if (res == 0) {
                 /* wee need more data! */
                 conn_set_state(c, conn_waiting);
             }
+			else if(res == -1) { 
+				//local file i/o : run all the input data
+				conn_set_state(c, conn_closing);
+			}
 
             break;
 
@@ -5849,7 +5993,8 @@ static void maximize_sndbuf(const int sfd) {
 static int server_socket(const char *interface,
                          int port,
                          enum network_transport transport,
-                         FILE *portnumber_file) {
+                         FILE *portnumber_file,
+						 enum protocol prot) {
     int sfd;
     struct linger ling = {0, 0};
     struct addrinfo *ai;
@@ -5861,141 +6006,156 @@ static int server_socket(const char *interface,
     int success = 0;
     int flags =1;
 
-    hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
+	if(prot == local_file_prot) {
+		char filename[70];
+		sprintf(filename, "/home/workloads/tracea_load_simple_test.txt");
+		sfd = open(filename, O_RDONLY);
+		if (!(listen_conn = conn_new(sfd, conn_read,
+								EV_READ | EV_PERSIST, 1,
+								transport, main_base))) {
+					fprintf(stderr, "failed to create listening connection\n");
+					exit(EXIT_FAILURE);
+				}
 
-    if (port == -1) {
-        port = 0;
-    }
-    snprintf(port_buf, sizeof(port_buf), "%d", port);
-    error= getaddrinfo(interface, port_buf, &hints, &ai);
-    if (error != 0) {
-        if (error != EAI_SYSTEM)
-          fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
-        else
-          perror("getaddrinfo()");
-        return 1;
-    }
+		return 0;
 
-    for (next= ai; next; next= next->ai_next) {
-        conn *listen_conn_add;
-        if ((sfd = new_socket(next)) == -1) {
-            /* getaddrinfo can return "junk" addresses,
-             * we make sure at least one works before erroring.
-             */
-            if (errno == EMFILE) {
-                /* ...unless we're out of fds */
-                perror("server_socket");
-                exit(EX_OSERR);
-            }
-            continue;
-        }
+	}
+	else{
+		hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
+
+		if (port == -1) {
+			port = 0;
+		}
+		snprintf(port_buf, sizeof(port_buf), "%d", port);
+		error= getaddrinfo(interface, port_buf, &hints, &ai);
+		if (error != 0) {
+			if (error != EAI_SYSTEM)
+				fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
+			else
+				perror("getaddrinfo()");
+			return 1;
+		}
+
+		for (next= ai; next; next= next->ai_next) {
+			conn *listen_conn_add;
+			if ((sfd = new_socket(next)) == -1) {
+				/* getaddrinfo can return "junk" addresses,
+				 * we make sure at least one works before erroring.
+				 */
+				if (errno == EMFILE) {
+					/* ...unless we're out of fds */
+					perror("server_socket");
+					exit(EX_OSERR);
+				}
+				continue;
+			}
 
 #ifdef IPV6_V6ONLY
-        if (next->ai_family == AF_INET6) {
-            error = setsockopt(sfd, IPPROTO_IPV6, IPV6_V6ONLY, (char *) &flags, sizeof(flags));
-            if (error != 0) {
-                perror("setsockopt");
-                close(sfd);
-                continue;
-            }
-        }
+			if (next->ai_family == AF_INET6) {
+				error = setsockopt(sfd, IPPROTO_IPV6, IPV6_V6ONLY, (char *) &flags, sizeof(flags));
+				if (error != 0) {
+					perror("setsockopt");
+					close(sfd);
+					continue;
+				}
+			}
 #endif
 
-        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-        if (IS_UDP(transport)) {
-            maximize_sndbuf(sfd);
-        } else {
-            error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-            if (error != 0)
-                perror("setsockopt");
+			setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+			if (IS_UDP(transport)) {
+				maximize_sndbuf(sfd);
+			} else {
+				error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+				if (error != 0)
+					perror("setsockopt");
 
-            error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-            if (error != 0)
-                perror("setsockopt");
+				error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+				if (error != 0)
+					perror("setsockopt");
 
-            error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
-            if (error != 0)
-                perror("setsockopt");
-        }
+				error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+				if (error != 0)
+					perror("setsockopt");
+			}
 
-        if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
-            if (errno != EADDRINUSE) {
-                perror("bind()");
-                close(sfd);
-                freeaddrinfo(ai);
-                return 1;
-            }
-            close(sfd);
-            continue;
-        } else {
-            success++;
-            if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
-                perror("listen()");
-                close(sfd);
-                freeaddrinfo(ai);
-                return 1;
-            }
-            if (portnumber_file != NULL &&
-                (next->ai_addr->sa_family == AF_INET ||
-                 next->ai_addr->sa_family == AF_INET6)) {
-                union {
-                    struct sockaddr_in in;
-                    struct sockaddr_in6 in6;
-                } my_sockaddr;
-                socklen_t len = sizeof(my_sockaddr);
-                if (getsockname(sfd, (struct sockaddr*)&my_sockaddr, &len)==0) {
-                    if (next->ai_addr->sa_family == AF_INET) {
-                        fprintf(portnumber_file, "%s INET: %u\n",
-                                IS_UDP(transport) ? "UDP" : "TCP",
-                                ntohs(my_sockaddr.in.sin_port));
-                    } else {
-                        fprintf(portnumber_file, "%s INET6: %u\n",
-                                IS_UDP(transport) ? "UDP" : "TCP",
-                                ntohs(my_sockaddr.in6.sin6_port));
-                    }
-                }
-            }
-        }
+			if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
+				if (errno != EADDRINUSE) {
+					perror("bind()");
+					close(sfd);
+					freeaddrinfo(ai);
+					return 1;
+				}
+				close(sfd);
+				continue;
+			} else {
+				success++;
+				if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
+					perror("listen()");
+					close(sfd);
+					freeaddrinfo(ai);
+					return 1;
+				}
+				if (portnumber_file != NULL &&
+						(next->ai_addr->sa_family == AF_INET ||
+						 next->ai_addr->sa_family == AF_INET6)) {
+					union {
+						struct sockaddr_in in;
+						struct sockaddr_in6 in6;
+					} my_sockaddr;
+					socklen_t len = sizeof(my_sockaddr);
+					if (getsockname(sfd, (struct sockaddr*)&my_sockaddr, &len)==0) {
+						if (next->ai_addr->sa_family == AF_INET) {
+							fprintf(portnumber_file, "%s INET: %u\n",
+									IS_UDP(transport) ? "UDP" : "TCP",
+									ntohs(my_sockaddr.in.sin_port));
+						} else {
+							fprintf(portnumber_file, "%s INET6: %u\n",
+									IS_UDP(transport) ? "UDP" : "TCP",
+									ntohs(my_sockaddr.in6.sin6_port));
+						}
+					}
+				}
+			}
 
-        if (IS_UDP(transport)) {
-            int c;
+			if (IS_UDP(transport)) {
+				int c;
 
-            for (c = 0; c < settings.num_threads_per_udp; c++) {
-                /* Allocate one UDP file descriptor per worker thread;
-                 * this allows "stats conns" to separately list multiple
-                 * parallel UDP requests in progress.
-                 *
-                 * The dispatch code round-robins new connection requests
-                 * among threads, so this is guaranteed to assign one
-                 * FD to each thread.
-                 */
-                int per_thread_fd = c ? dup(sfd) : sfd;
-                dispatch_conn_new(per_thread_fd, conn_read,
-                                  EV_READ | EV_PERSIST,
-                                  UDP_READ_BUFFER_SIZE, transport);
-            }
-        } else {
-            if (!(listen_conn_add = conn_new(sfd, conn_listening,
-                                             EV_READ | EV_PERSIST, 1,
-                                             transport, main_base))) {
-                fprintf(stderr, "failed to create listening connection\n");
-                exit(EXIT_FAILURE);
-            }
-            listen_conn_add->next = listen_conn;
-            listen_conn = listen_conn_add;
-        }
-    }
+				for (c = 0; c < settings.num_threads_per_udp; c++) {
+					/* Allocate one UDP file descriptor per worker thread;
+					 * this allows "stats conns" to separately list multiple
+					 * parallel UDP requests in progress.
+					 *
+					 * The dispatch code round-robins new connection requests
+					 * among threads, so this is guaranteed to assign one
+					 * FD to each thread.
+					 */
+					int per_thread_fd = c ? dup(sfd) : sfd;
+					dispatch_conn_new(per_thread_fd, conn_read,
+							EV_READ | EV_PERSIST,
+							UDP_READ_BUFFER_SIZE, transport);
+				}
+			} else {
+				if (!(listen_conn_add = conn_new(sfd, conn_listening,
+								EV_READ | EV_PERSIST, 1,
+								transport, main_base))) {
+					fprintf(stderr, "failed to create listening connection\n");
+					exit(EXIT_FAILURE);
+				}
+				listen_conn_add->next = listen_conn;
+				listen_conn = listen_conn_add;
+			}
+		}
 
-    freeaddrinfo(ai);
-
+		freeaddrinfo(ai);
+	}
     /* Return zero iff we detected no errors in starting up connections */
     return success == 0;
 }
 
 static int server_sockets(int port, enum network_transport transport,
-                          FILE *portnumber_file) {
+                          FILE *portnumber_file, enum protocol protocol) {
     if (settings.inter == NULL) {
-        return server_socket(settings.inter, port, transport, portnumber_file);
+        return server_socket(settings.inter, port, transport, portnumber_file, protocol);
     } else {
         // tokenize them and bind to each one of them..
         char *b;
@@ -6049,7 +6209,7 @@ static int server_sockets(int port, enum network_transport transport,
             if (strcmp(p, "*") == 0) {
                 p = NULL;
             }
-            ret |= server_socket(p, the_port, transport, portnumber_file);
+            ret |= server_socket(p, the_port, transport, portnumber_file, protocol);
         }
         free(list);
         return ret;
@@ -6966,6 +7126,8 @@ int main (int argc, char **argv) {
                 settings.binding_protocol = binary_prot;
             } else if (strcmp(optarg, "ascii") == 0) {
                 settings.binding_protocol = ascii_prot;
+            } else if (strcmp(optarg, "file") == 0) {
+                settings.binding_protocol = local_file_prot;
             } else {
                 fprintf(stderr, "Invalid value for binding protocol: %s\n"
                         " -- should be one of auto, binary, or ascii\n", optarg);
@@ -7525,7 +7687,14 @@ int main (int argc, char **argv) {
         settings.num_threads_per_udp = settings.num_threads;
     }
 
+	/** Set the default protocol to file in/out protocol **/
+	if(!protocol_specified) {
+		settings.binding_protocol = local_file_prot; 
+	}
+
     if (settings.sasl) {
+		/** Don't use sasl **/
+		assert(0);
         if (!protocol_specified) {
             settings.binding_protocol = binary_prot;
         } else {
@@ -7767,7 +7936,7 @@ int main (int argc, char **argv) {
 
         errno = 0;
         if (settings.port && server_sockets(settings.port, tcp_transport,
-                                           portnumber_file)) {
+                                           portnumber_file, settings.binding_protocol)) {
             vperror("failed to listen on TCP port %d", settings.port);
             exit(EX_OSERR);
         }
@@ -7782,7 +7951,7 @@ int main (int argc, char **argv) {
         /* create the UDP listening socket and bind it */
         errno = 0;
         if (settings.udpport && server_sockets(settings.udpport, udp_transport,
-                                              portnumber_file)) {
+                                              portnumber_file, settings.binding_protocol)) {
             vperror("failed to listen on UDP port %d", settings.udpport);
             exit(EX_OSERR);
         }
@@ -7816,10 +7985,15 @@ int main (int argc, char **argv) {
     /* Initialize the uriencode lookup table. */
     uriencode_init();
 
-    /* enter the event loop */
-    if (event_base_loop(main_base, 0) != 0) {
-        retval = EXIT_FAILURE;
-    }
+	if(settings.binding_protocol != local_file_prot) {
+		/* enter the event loop */
+		if (event_base_loop(main_base, 0) != 0) {
+			retval = EXIT_FAILURE;
+		}
+	}
+	else {
+		drive_machine(listen_conn);
+	}
 
     stop_assoc_maintenance_thread();
 
