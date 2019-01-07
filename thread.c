@@ -280,7 +280,6 @@ static void cqi_free(CQ_ITEM *item) {
     pthread_mutex_unlock(&cqi_freelist_lock);
 }
 
-
 /*
  * Creates a worker thread.
  */
@@ -326,20 +325,14 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         exit(1);
     }
 
-	if(settings.binding_protocol != local_file_prot) {
+	/* Listen for notifications from other threads */
+	event_set(&me->notify_event, me->notify_receive_fd,
+			EV_READ | EV_PERSIST, thread_libevent_process, me);
+	event_base_set(me->base, &me->notify_event);
 
-		/* Listen for notifications from other threads */
-		event_set(&me->notify_event, me->notify_receive_fd,
-				EV_READ | EV_PERSIST, thread_libevent_process, me);
-		event_base_set(me->base, &me->notify_event);
-
-		if (event_add(&me->notify_event, 0) == -1) {
-			fprintf(stderr, "Can't monitor libevent notify pipe\n");
-			exit(1);
-		}
-	}
-	else {
-		//TODO : Should initialize thread
+	if (event_add(&me->notify_event, 0) == -1) {
+		fprintf(stderr, "Can't monitor libevent notify pipe\n");
+		exit(1);
 	}
 
     me->new_conn_queue = malloc(sizeof(struct conn_queue));
@@ -395,7 +388,6 @@ static void *worker_libevent(void *arg) {
     event_base_free(me->base);
     return NULL;
 }
-
 
 /*
  * Processes an incoming "handle a new connection" item. This is called when
@@ -741,7 +733,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
  *
  * nthreads  Number of worker event handler threads to spawn
  */
-void memcached_thread_init(int nthreads, void *arg) {
+void memcached_thread_init_for_local_file_io(conn *c, int nthreads, void *arg) {
     int         i;
     int         power;
 
@@ -814,6 +806,96 @@ void memcached_thread_init(int nthreads, void *arg) {
         stats_state.reserved_fds += 5;
     }
 
+	c->thread = threads;
+
+    //for (i = 0; i < nthreads; i++) {
+    //    create_worker(worker_libevent, &threads[i]);
+    //}
+
+    /* Wait for all the threads to set themselves up before returning. */
+    //pthread_mutex_lock(&init_lock);
+    //wait_for_thread_registration(nthreads);
+    //pthread_mutex_unlock(&init_lock);
+}
+
+/*
+ * Initializes the thread subsystem, creating various worker threads.
+ *
+ * nthreads  Number of worker event handler threads to spawn
+ */
+void memcached_thread_init(int nthreads, void *arg) {
+    int         i;
+    int         power;
+
+    for (i = 0; i < POWER_LARGEST; i++) {
+        pthread_mutex_init(&lru_locks[i], NULL);
+    }
+    pthread_mutex_init(&worker_hang_lock, NULL);
+
+    pthread_mutex_init(&init_lock, NULL);
+    pthread_cond_init(&init_cond, NULL);
+
+    pthread_mutex_init(&cqi_freelist_lock, NULL);
+    cqi_freelist = NULL;
+
+    /* Want a wide lock table, but don't waste memory */
+    if (nthreads < 3) {
+        power = 10;
+    } else if (nthreads < 4) {
+        power = 11;
+    } else if (nthreads < 5) {
+        power = 12;
+    } else if (nthreads <= 10) {
+        power = 13;
+    } else if (nthreads <= 20) {
+        power = 14;
+    } else {
+        /* 32k buckets. just under the hashpower default. */
+        power = 15;
+    }
+
+    if (power >= hashpower) {
+        fprintf(stderr, "Hash table power size (%d) cannot be equal to or less than item lock table (%d)\n", hashpower, power);
+        fprintf(stderr, "Item lock table grows with `-t N` (worker threadcount)\n");
+        fprintf(stderr, "Hash table grows with `-o hashpower=N` \n");
+        exit(1);
+    }
+
+    item_lock_count = hashsize(power);
+    item_lock_hashpower = power;
+
+    item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
+    if (! item_locks) {
+        perror("Can't allocate item locks");
+        exit(1);
+    }
+    for (i = 0; i < item_lock_count; i++) {
+        pthread_mutex_init(&item_locks[i], NULL);
+    }
+
+    threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
+    if (! threads) {
+        perror("Can't allocate thread descriptors");
+        exit(1);
+    }
+
+    for (i = 0; i < nthreads; i++) {
+        int fds[2];
+        if (pipe(fds)) {
+            perror("Can't create notify pipe");
+            exit(1);
+        }
+
+        threads[i].notify_receive_fd = fds[0];
+        threads[i].notify_send_fd = fds[1];
+#ifdef EXTSTORE
+        threads[i].storage = arg;
+#endif
+        setup_thread(&threads[i]);
+
+        /* Reserve three fds for the libevent base, and two for the pipe */
+        stats_state.reserved_fds += 5;
+    }
     /* Create threads after we've done all the libevent setup. */
     for (i = 0; i < nthreads; i++) {
         create_worker(worker_libevent, &threads[i]);

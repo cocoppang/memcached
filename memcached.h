@@ -747,6 +747,7 @@ extern int daemonize(int nochdir, int noclose);
  * also #define-d to directly call the underlying code in singlethreaded mode.
  */
 void memcached_thread_init(int nthreads, void *arg);
+void memcached_thread_init_for_local_file_io(conn *c, int nthreads, void *arg);
 void redispatch_conn(conn *c);
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size, enum network_transport transport);
 void sidethread_conn_close(conn *c);
@@ -788,6 +789,9 @@ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
                  const char *fmt, ...);
 
 enum store_item_type store_item(item *item, int comm, conn *c);
+
+
+void* local_file_worker_thread(void* arg);
 
 #if HAVE_DROP_PRIVILEGES
 extern void drop_privileges(void);

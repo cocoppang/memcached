@@ -127,6 +127,9 @@ struct settings settings;
 time_t process_started;     /* when the process was started */
 conn **conns;
 
+time_t start1, end1, mid1;
+int set_size = 10000000;
+
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 #ifdef EXTSTORE
@@ -805,6 +808,29 @@ void conn_free(conn *c) {
     }
 }
 
+static void conn_local_file_io_close(conn *c) {
+    assert(c != NULL);
+
+    if (settings.verbose > 1)
+        fprintf(stderr, "<%d connection closed.\n", c->sfd);
+
+    conn_cleanup(c);
+
+    //MEMCACHED_CONN_RELEASE(c->sfd);
+    conn_set_state(c, conn_closed);
+    //close(c->sfd);
+
+    //pthread_mutex_lock(&conn_lock);
+    //allow_new_conns = true;
+    //pthread_mutex_unlock(&conn_lock);
+
+    STATS_LOCK();
+    stats_state.curr_conns--;
+    STATS_UNLOCK();
+
+    return;
+}
+
 static void conn_close(conn *c) {
     assert(c != NULL);
 
@@ -1183,7 +1209,8 @@ static void complete_nread_file(conn *c) {
 
     item_remove(c->item);       /* release the c->item reference */
     c->item = 0;
-
+    
+	conn_set_state(c, conn_read);
 }
 /*
  * we get here after reading the value in set/add/replace commands. The command
@@ -4163,11 +4190,13 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     c->cmd = comm;
 
 
-	//just set the value to ritem (do not process unnecessary codes)
-	memmove(c->ritem, tokens[2].value, tokens[2].length);
-	c->rlbytes = 0;
-    conn_set_state(c, conn_nread);
+	if(c->protocol == local_file_prot) {
+		//just set the value to ritem (do not process unnecessary codes)
+		memcpy(c->ritem, tokens[2].value, tokens[2].length);
+		c->rlbytes = 0;
+	}
 
+    conn_set_state(c, conn_nread);
 }
 
 static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -5102,7 +5131,7 @@ static int try_read_command(conn *c) {
 	else if (c->protocol == local_file_prot) {
 		//process commands
 		//process_command(c, c->inst[c->thread->thread_id][c->cur_inst_count[c->thread->thread_id]]);
-		if(c->cur_inst_count[0] == 500) {
+		if(c->cur_inst_count[0] == set_size) {
 			return -1;
 		}
 		process_command(c, c->inst[0][c->cur_inst_count[0]]);
@@ -5170,7 +5199,6 @@ static enum try_read_result try_read_file(conn *c) {
 	FILE *f;
 	int thread_id;
 
-	int set_size = 500;
     
 	assert(c != NULL);
 	
@@ -5616,7 +5644,7 @@ static void drive_machine(conn *c) {
 		
 		/** Here we can fetch the file to the memory instead of fetching request from clients **/
         case conn_read:
-            res = IS_FILE_PROTOCOL(c->protocol) ? try_read_file(c) : (IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c));
+            res = IS_FILE_PROTOCOL(c->protocol) ? READ_DATA_RECEIVED : (IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c));
 
             switch (res) {
             case READ_NO_DATA_RECEIVED:
@@ -5882,10 +5910,15 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_closing:
-            if (IS_UDP(c->transport))
-                conn_cleanup(c);
-            else
-                conn_close(c);
+			if (IS_FILE_PROTOCOL(c->protocol)) {
+				conn_local_file_io_close(c);
+			}
+			else{
+				if (IS_UDP(c->transport))
+					conn_cleanup(c);
+				else
+					conn_close(c);
+			}
             stop = true;
             break;
 
@@ -6008,7 +6041,7 @@ static int server_socket(const char *interface,
 
 	if(prot == local_file_prot) {
 		char filename[70];
-		sprintf(filename, "/home/workloads/tracea_load_simple_test.txt");
+		sprintf(filename, "/home/workloads/workload_16B_16B/tracea_load_a_m.txt");
 		sfd = open(filename, O_RDONLY);
 		if (!(listen_conn = conn_new(sfd, conn_read,
 								EV_READ | EV_PERSIST, 1,
@@ -6716,6 +6749,26 @@ static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
 
     slab_sizes[i] = 0;
     return true;
+}
+
+void* local_file_worker_thread(void* arg) {
+
+	conn* c = arg;
+	LIBEVENT_THREAD* thread = c->thread;
+
+	thread->l = logger_create();
+	thread->lru_bump_buf = item_lru_bump_buf_create();
+	if(thread->l == NULL || thread->lru_bump_buf == NULL) {
+		abort();
+	}
+	if(settings.drop_privileges) {
+		drop_worker_privileges();
+	}
+	//register_thread_initialized();
+	
+	drive_machine(listen_conn);
+
+	return NULL;
 }
 
 int main (int argc, char **argv) {
@@ -7863,7 +7916,8 @@ int main (int argc, char **argv) {
     memcached_thread_init(settings.num_threads, storage);
     init_lru_crawler(storage);
 #else
-    memcached_thread_init(settings.num_threads, NULL);
+	if(settings.binding_protocol != local_file_prot)
+    	memcached_thread_init(settings.num_threads, NULL);
     init_lru_crawler(NULL);
 #endif
 
@@ -7992,7 +8046,24 @@ int main (int argc, char **argv) {
 		}
 	}
 	else {
-		drive_machine(listen_conn);
+		try_read_file(listen_conn);
+		fprintf(stdout, "READ file done\n");
+    	memcached_thread_init_for_local_file_io(listen_conn, settings.num_threads, NULL);
+		int i;
+		int status;
+
+		start1 = time(0);
+		for(i = 0; i < settings.num_threads; i++) {
+			pthread_create(&listen_conn->thread[i].thread_id, NULL, local_file_worker_thread, (void*)listen_conn);
+		}
+
+		for(i = 0; i < settings.num_threads;i++) {
+			pthread_join(listen_conn->thread[i].thread_id, (void **)&status);
+		}
+
+		end1 = time(0);
+
+		fprintf(stdout, "Executed Time %f\n", difftime(end1, start1));
 	}
 
     stop_assoc_maintenance_thread();
