@@ -129,6 +129,8 @@ conn **conns;
 
 time_t start1, end1, mid1;
 int set_size = 10000000;
+//int set_size = 500;
+bool run_flag = false;
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
@@ -1187,25 +1189,41 @@ static void complete_nread_file(conn *c) {
 	item *it = c->item;
 	int comm = c->cmd;
     enum store_item_type ret;
+    bool is_valid = false;
 
-	ret = store_item(it, comm, c);
+	memcpy(ITEM_data(it) + it->nbytes -2, "\r\n",2);
 
-    switch (ret) {
-    case STORED:
-        out_string(c, "STORED");
-        break;
-    case EXISTS:
-        out_string(c, "EXISTS");
-        break;
-    case NOT_FOUND:
-        out_string(c, "NOT_FOUND");
-        break;
-    case NOT_STORED:
-        out_string(c, "NOT_STORED");
-        break;
-    default:
-        out_string(c, "SERVER_ERROR Unhandled storage type.");
-    }
+    if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) == 0) {
+		is_valid = true;
+		//fprintf(stdout, "valid data\n");
+	}
+
+	if (is_valid) {
+		ret = store_item(it, comm, c);
+
+		//fprintf(stdout, "key : %s data: %s\n", ITEM_key(it), ITEM_data(it));
+
+		switch (ret) {
+			case STORED:
+				out_string(c, "STORED");
+				break;
+			case EXISTS:
+				out_string(c, "EXISTS");
+				break;
+			case NOT_FOUND:
+				out_string(c, "NOT_FOUND");
+				break;
+			case NOT_STORED:
+				out_string(c, "NOT_STORED");
+				break;
+			default:
+				out_string(c, "SERVER_ERROR Unhandled storage type.");
+		}
+	}
+
+	if(is_valid == false || ret != STORED) {
+		fprintf(stderr, "store error\n");
+	}
 
     item_remove(c->item);       /* release the c->item reference */
     c->item = 0;
@@ -4070,7 +4088,9 @@ stop:
         conn_release_items(c);
     }
     else {
-        conn_set_state(c, conn_mwrite);
+		//When the read completes, it jumps to process another requests
+        //conn_set_state(c, conn_mwrite);
+        conn_set_state(c, conn_read);
         c->msgcurr = 0;
     }
 }
@@ -4107,7 +4127,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 	}
 	else {
 		//set default value 
-		exptime_int = 60;
+		exptime_int = 8192;
 		flags = 0;
 		//TODO value length
 		vlen = 16;
@@ -5131,11 +5151,24 @@ static int try_read_command(conn *c) {
 	else if (c->protocol == local_file_prot) {
 		//process commands
 		//process_command(c, c->inst[c->thread->thread_id][c->cur_inst_count[c->thread->thread_id]]);
-		if(c->cur_inst_count[0] == set_size) {
+
+		if(c->cur_inst_count[0] == set_size && run_flag == false) {
+			mid1 = time(0);
+			run_flag = true;
+		}
+		else if(c->cur_inst_count2[0] == set_size && run_flag == true) {
 			return -1;
 		}
-		process_command(c, c->inst[0][c->cur_inst_count[0]]);
-		c->cur_inst_count[0]++;
+
+		if(run_flag == true) {
+			process_command(c, c->inst2[0][c->cur_inst_count2[0]]);
+			c->cur_inst_count2[0]++;
+		}
+		else if(run_flag == false) {
+			process_command(c, c->inst[0][c->cur_inst_count[0]]);
+			c->cur_inst_count[0]++;
+		}
+		
 	}
 	else {
         char *el, *cont;
@@ -5197,6 +5230,7 @@ static enum try_read_result try_read_file(conn *c) {
 	char buf2[BUF_SIZE];
 	char key[16];
 	FILE *f;
+	FILE *f2;
 	int thread_id;
 
     
@@ -5213,7 +5247,19 @@ static enum try_read_result try_read_file(conn *c) {
 		}
 	}
 
-	if(c->inst == NULL || c->cur_inst_count == NULL) 
+	c->inst2 = (char***)malloc(sizeof(char**)*settings.num_threads);
+	c->cur_inst_count2 = (int*)malloc(sizeof(int)*settings.num_threads);
+
+	for(i = 0; i < settings.num_threads;i++) {
+		c->cur_inst_count2[i] = 0;
+		c->inst2[i] = (char**)malloc(sizeof(char*)*set_size);
+		for(j = 0; j < set_size;j++) {
+			c->inst2[i][j] = (char*)malloc(sizeof(char)*BUF_SIZE);
+		}
+	}
+
+	if(c->inst == NULL || c->cur_inst_count == NULL || 
+			c->inst2 == NULL || c->cur_inst_count2 == NULL) 
 		return READ_MEMORY_ERROR;
 
 	f = fdopen(c->sfd, "r");
@@ -5233,6 +5279,26 @@ static enum try_read_result try_read_file(conn *c) {
 		memcpy(c->inst[thread_id][i++], buf2, BUF_SIZE);
 		
 	}
+
+	f2 = fopen("/home/workloads/workload_16B_16B/tracea_run_a_m.txt","r");
+	//f2 = fopen("/home/workloads/tracea_run_simple.txt","r");
+	i = 0;
+	while(i < set_size) {
+		if(fgets(buf, BUF_SIZE, f2) == NULL) {
+			return READ_NO_DATA_RECEIVED;
+		}
+		buf[strlen(buf)-1] = 0;
+		memcpy(buf2, buf, BUF_SIZE);
+		tok = strtok_r(buf+4," ",&temp_);
+		memset(key, 0, 16);
+		memcpy(key, tok, strlen(tok));
+
+		//single thread
+		thread_id = 0;
+		memcpy(c->inst2[thread_id][i++], buf2, BUF_SIZE);
+		
+	}
+	fclose(f2);
 
 	return READ_DATA_RECEIVED;
 }
@@ -6042,6 +6108,7 @@ static int server_socket(const char *interface,
 	if(prot == local_file_prot) {
 		char filename[70];
 		sprintf(filename, "/home/workloads/workload_16B_16B/tracea_load_a_m.txt");
+		//sprintf(filename, "/home/workloads//tracea_load_simple.txt");
 		sfd = open(filename, O_RDONLY);
 		if (!(listen_conn = conn_new(sfd, conn_read,
 								EV_READ | EV_PERSIST, 1,
@@ -8063,7 +8130,8 @@ int main (int argc, char **argv) {
 
 		end1 = time(0);
 
-		fprintf(stdout, "Executed Time %f\n", difftime(end1, start1));
+		fprintf(stdout, "Executed Time for load %f\n", difftime(mid1, start1));
+		fprintf(stdout, "Executed Time for run %f\n", difftime(end1, mid1));
 	}
 
     stop_assoc_maintenance_thread();

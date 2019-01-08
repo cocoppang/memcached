@@ -616,7 +616,9 @@ struct conn {
 
 	/** For local file experiments **/
 	char ***inst;
+	char ***inst2;
 	int *cur_inst_count;
+	int *cur_inst_count2;
 
     /* data for the nread state */
 
