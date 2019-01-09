@@ -225,6 +225,12 @@ static void stats_reset(void) {
 }
 
 static void settings_init(void) {
+
+	//For file io experiments
+	settings.workload = 'a';
+	settings.value_size = 16;
+	settings.buffer_size = 64;
+	
     settings.use_cas = true;
     settings.access = 0700;
     settings.port = 11211;
@@ -4144,7 +4150,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 		exptime_int = 8192;
 		flags = 0;
 		//TODO value length
-		vlen = 16;
+		vlen = settings.value_size;
 	}
 
     /* Ubuntu 8.04 breaks when I pass exptime to safe_strtol */
@@ -4803,6 +4809,10 @@ static int process_command(conn *c, char *command, int thread_id) {
 			process_update_command(c, tokens, ntokens, NREAD_SET, false, thread_id);
 			return 1;
 		}
+		else if(strcmp(tokens[COMMAND_TOKEN].value, "APPEND") == 0) {
+			process_update_command(c, tokens, ntokens, NREAD_APPEND, false, thread_id);
+			return 2;
+		}
 	}
 	else {
 		if (ntokens >= 3 &&
@@ -5254,14 +5264,13 @@ static int try_read_command(conn *c) {
 
 
 /** Read all the input file like shieldstore front-hand **/
-#define BUF_SIZE 64
 static enum try_read_result try_read_file(conn *c) {
 	int i,j;
 
 	char *tok;
 	char *temp_;
-	char buf[BUF_SIZE];
-	char buf2[BUF_SIZE];
+	char *buf;
+	char *buf2;
 	char key[16];
 	FILE *f;
 	FILE *f2;
@@ -5270,6 +5279,9 @@ static enum try_read_result try_read_file(conn *c) {
 
     
 	assert(c != NULL);
+
+	buf = (char*)malloc(sizeof(char)*settings.buffer_size);
+	buf2 = (char*)malloc(sizeof(char)*settings.buffer_size);
 	
 	c->inst = (char***)malloc(sizeof(char**)*settings.num_threads);
 	c->inst_count = (int*)malloc(sizeof(int)*settings.num_threads);
@@ -5278,7 +5290,7 @@ static enum try_read_result try_read_file(conn *c) {
 		c->inst_count[i] = 0;
 		c->inst[i] = (char**)malloc(sizeof(char*)*set_size);
 		for(j = 0; j < set_size;j++) {
-			c->inst[i][j] = (char*)malloc(sizeof(char)*BUF_SIZE);
+			c->inst[i][j] = (char*)malloc(sizeof(char)*settings.buffer_size);
 		}
 	}
 
@@ -5289,7 +5301,7 @@ static enum try_read_result try_read_file(conn *c) {
 		c->inst_count2[i] = 0;
 		c->inst2[i] = (char**)malloc(sizeof(char*)*set_size);
 		for(j = 0; j < set_size;j++) {
-			c->inst2[i][j] = (char*)malloc(sizeof(char)*BUF_SIZE);
+			c->inst2[i][j] = (char*)malloc(sizeof(char)*settings.buffer_size);
 		}
 	}
 
@@ -5300,46 +5312,50 @@ static enum try_read_result try_read_file(conn *c) {
 	f = fdopen(c->sfd, "r");
 	i = 0;
 	while(i < set_size) {
-		if(fgets(buf, BUF_SIZE, f) == NULL) {
+		if(fgets(buf, settings.buffer_size, f) == NULL) {
 			fprintf(stderr, "load file read error\n");
 			return READ_NO_DATA_RECEIVED;
 		}
 		buf[strlen(buf)-1] = 0;
-		memcpy(buf2, buf, BUF_SIZE);
+		memcpy(buf2, buf, settings.buffer_size);
 		tok = strtok_r(buf+4," ",&temp_);
 		memset(key, 0, 16);
 		memcpy(key, tok, strlen(tok));
 
 		//single thread
 		thread_id = hash(key, strlen(key))%settings.num_threads;
-		memcpy(c->inst[thread_id][c->inst_count[thread_id]++], buf2, BUF_SIZE);
+		memcpy(c->inst[thread_id][c->inst_count[thread_id]++], buf2, settings.buffer_size);
 		i++;
 		
 	}
 
-	sprintf(filename, "/home/workloads/workload_16B_16B/tracea_run_a_m.txt");
+	sprintf(filename, "/home/workloads/workload_16B_%dB/tracea_run_%c_m.txt", settings.value_size, settings.workload);
+	fprintf(stdout, "Run file name : %s\n", filename);
 	f2 = fopen(filename,"r");
 
 	i = 0;
 	while(i < set_size) {
-		if(fgets(buf, BUF_SIZE, f2) == NULL) {
+		if(fgets(buf, settings.buffer_size, f2) == NULL) {
 			fprintf(stderr, "run file read error\n");
 			return READ_NO_DATA_RECEIVED;
 		}
 		buf[strlen(buf)-1] = 0;
-		memcpy(buf2, buf, BUF_SIZE);
+		memcpy(buf2, buf, settings.buffer_size);
 		tok = strtok_r(buf+4," ",&temp_);
 		memset(key, 0, 16);
 		memcpy(key, tok, strlen(tok));
 
 		//single thread
 		thread_id = hash(key, strlen(key))%settings.num_threads;
-		memcpy(c->inst2[thread_id][c->inst_count2[thread_id]++], buf2, BUF_SIZE);
+		memcpy(c->inst2[thread_id][c->inst_count2[thread_id]++], buf2, settings.buffer_size);
 		i++;
 		
 	}
 	
 	fclose(f2);
+
+	free(buf);
+	free(buf2);
 
 	return READ_DATA_RECEIVED;
 }
@@ -6148,8 +6164,8 @@ static int server_socket(const char *interface,
 
 	if(prot == local_file_prot) {
 		char filename[70];
-		sprintf(filename, "/home/workloads/workload_16B_16B/tracea_load_a_m.txt");
-		//sprintf(filename, "/home/workloads//tracea_load_simple.txt");
+		sprintf(filename, "/home/workloads/workload_16B_%dB/tracea_load_%c_m.txt", settings.value_size, settings.workload);
+		fprintf(stdout, "Load file name : %s\n", filename);
 		sfd = open(filename, O_RDONLY);
 		if (!(listen_conn = conn_new(sfd, conn_read,
 								EV_READ | EV_PERSIST, 1,
@@ -6500,6 +6516,9 @@ static void clock_handler(const int fd, const short which, void *arg) {
 
 static void usage(void) {
     printf(PACKAGE " " VERSION "\n");
+	//For file io experiments 
+	printf("-w, --workload=<workload_name>	workload name for file io experiments\n"
+		   "-z, --value-size=<num>	  value size for file io experiments\n");
     printf("-p, --port=<num>          TCP port to listen on (default: 11211)\n"
            "-U, --udp-port=<num>      UDP port to listen on (default: 0, off)\n"
            "-s, --unix-socket=<file>  UNIX socket to listen on (disables network support)\n"
@@ -6862,14 +6881,12 @@ static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
 void* local_file_worker_thread(void* arg) {
 
 	int thread_id = *(int*)arg;
-	bool complete_flag = false;
 	bool run_flag = false;
 	int cur_inst_count = 0;
 	int cur_inst_count2 = 0;
 	int comm = -1;
 
-	//fprintf(stdout, "thread id : %d, complete_flag : %d\n", thread_id, complete_flag == true ? 1:0);
-	while(!complete_flag) {
+	while(1) {
 		if(cur_inst_count == listen_conn->inst_count[thread_id] && run_flag == false) {
 			pthread_barrier_wait(&conn_barrier);
 			if(thread_id == 0) {
@@ -6878,13 +6895,12 @@ void* local_file_worker_thread(void* arg) {
 			run_flag = true;
 		}
 		else if(cur_inst_count2 == listen_conn->inst_count2[thread_id] && run_flag == true) {
-			complete_flag = true;
 			break;
 		}
 
 		if(run_flag == true) {
 			comm = process_command(listen_conn, listen_conn->inst2[thread_id][cur_inst_count2], thread_id);
-			if(comm == 1) {
+			if(comm == 1 || comm == 2) {
 				complete_nread_file(listen_conn, thread_id);
 			}
 			else if(comm == -1) {
@@ -6894,7 +6910,7 @@ void* local_file_worker_thread(void* arg) {
 		}
 		else if(run_flag == false) {
 			comm = process_command(listen_conn, listen_conn->inst[thread_id][cur_inst_count], thread_id);
-			if(comm == 1) {
+			if(comm == 1 || comm == 2) {
 				complete_nread_file(listen_conn, thread_id);
 			}
 			else if(comm == -1) {
@@ -6903,10 +6919,6 @@ void* local_file_worker_thread(void* arg) {
 			cur_inst_count++;
 		}
 	}
-
-	//register_thread_initialized();
-	
-	//drive_machine(listen_conn);
 
 	return NULL;
 }
@@ -7126,6 +7138,8 @@ int main (int argc, char **argv) {
           "F"   /* Disable flush_all */
           "X"   /* Disable dump commands */
           "o:"  /* Extended generic options */
+		  "w:"  /* workload name */
+		  "z:"  /* workload value size */
           ;
 
     /* process arguments */
@@ -7162,15 +7176,40 @@ int main (int argc, char **argv) {
         {"disable-flush-all", no_argument, 0, 'F'},
         {"disable-dumping", no_argument, 0, 'X'},
         {"extended", required_argument, 0, 'o'},
+        {"workload", required_argument, 0, 'w'},
+        {"value-size", required_argument, 0, 'z'},
         {0, 0, 0, 0}
     };
     int optindex;
+
+	int value_len;
     while (-1 != (c = getopt_long(argc, argv, shortopts,
                     longopts, &optindex))) {
 #else
     while (-1 != (c = getopt(argc, argv, shortopts))) {
 #endif
         switch (c) {
+
+		case 'w':
+			settings.workload = optarg[0];
+			break;
+		case 'z':
+			value_len = atoi(optarg);
+			settings.value_size = value_len;
+			if(value_len == 16) {
+				settings.buffer_size = 64;
+			}
+			else if(value_len == 128) {
+				settings.buffer_size = 192;
+			}
+			else if(value_len == 512) {
+				settings.buffer_size = 576;
+			}
+			else {
+				assert(0);
+			}
+			break;
+
         case 'A':
             /* enables "shutdown" command */
             settings.shutdown_command = true;
@@ -8215,6 +8254,9 @@ int main (int argc, char **argv) {
 
 		fprintf(stdout, "Executed Time for load %f\n", difftime(mid1, start1));
 		fprintf(stdout, "Executed Time for run %f\n", difftime(end1, mid1));
+
+		//TODO: to finish the experiment with each load/run, do not 
+		return retval;
 	}
 
     stop_assoc_maintenance_thread();

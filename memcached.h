@@ -367,6 +367,12 @@ struct stats_state {
  * Globally accessible settings as derived from the commandline.
  */
 struct settings {
+
+	/** For file io experiments **/
+	char workload;
+	int value_size;
+	int buffer_size;
+
     size_t maxbytes;
     int maxconns;
     int port;
