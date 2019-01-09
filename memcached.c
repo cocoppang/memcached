@@ -5316,6 +5316,7 @@ static enum try_read_result try_read_file(conn *c) {
 			fprintf(stderr, "load file read error\n");
 			return READ_NO_DATA_RECEIVED;
 		}
+
 		buf[strlen(buf)-1] = 0;
 		memcpy(buf2, buf, settings.buffer_size);
 		tok = strtok_r(buf+4," ",&temp_);
@@ -5329,8 +5330,11 @@ static enum try_read_result try_read_file(conn *c) {
 		
 	}
 
+	fprintf(stderr, "load file read done\n");
+
 	sprintf(filename, "/home/workloads/workload_16B_%dB/tracea_run_%c_m.txt", settings.value_size, settings.workload);
-	fprintf(stdout, "Run file name : %s\n", filename);
+	//sprintf(filename, "workload_16B_%dB/tracea_run_%c_m.txt", settings.value_size, settings.workload);
+	fprintf(stderr, "Run file name : %s\n", filename);
 	f2 = fopen(filename,"r");
 
 	i = 0;
@@ -5339,6 +5343,7 @@ static enum try_read_result try_read_file(conn *c) {
 			fprintf(stderr, "run file read error\n");
 			return READ_NO_DATA_RECEIVED;
 		}
+
 		buf[strlen(buf)-1] = 0;
 		memcpy(buf2, buf, settings.buffer_size);
 		tok = strtok_r(buf+4," ",&temp_);
@@ -6165,7 +6170,8 @@ static int server_socket(const char *interface,
 	if(prot == local_file_prot) {
 		char filename[70];
 		sprintf(filename, "/home/workloads/workload_16B_%dB/tracea_load_%c_m.txt", settings.value_size, settings.workload);
-		fprintf(stdout, "Load file name : %s\n", filename);
+		//sprintf(filename, "workload_16B_%dB/tracea_load_%c_m.txt", settings.value_size, settings.workload);
+		fprintf(stderr, "Load file name : %s\n", filename);
 		sfd = open(filename, O_RDONLY);
 		if (!(listen_conn = conn_new(sfd, conn_read,
 								EV_READ | EV_PERSIST, 1,
@@ -7994,10 +8000,10 @@ int main (int argc, char **argv) {
             fprintf(stderr, "can't find the user %s to switch to\n", username);
             exit(EX_NOUSER);
         }
-        if (setgroups(0, NULL) < 0) {
-            fprintf(stderr, "failed to drop supplementary groups\n");
-            exit(EX_OSERR);
-        }
+        //if (setgroups(0, NULL) < 0) {
+        //    fprintf(stderr, "failed to drop supplementary groups\n");
+        //    exit(EX_OSERR);
+        //}
         if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
             fprintf(stderr, "failed to assume identity of user %s\n", username);
             exit(EX_OSERR);
@@ -8226,7 +8232,7 @@ int main (int argc, char **argv) {
 	}
 	else {
 		try_read_file(listen_conn);
-		fprintf(stdout, "READ file done\n");
+		fprintf(stderr, "READ file done\n");
 
 		//TODO should move other functions
 		listen_conn->item_t = (void**)malloc(sizeof(void*)*settings.num_threads);
@@ -8252,8 +8258,14 @@ int main (int argc, char **argv) {
 
 		end1 = time(0);
 
-		fprintf(stdout, "Executed Time for load %f\n", difftime(mid1, start1));
-		fprintf(stdout, "Executed Time for run %f\n", difftime(end1, mid1));
+		FILE *output;
+
+		output = fopen("result.txt", "a");
+
+		fprintf(output, "\nThread: %d Workload: %c ValSize: %d Execution time for Loading : %f", settings.num_threads, settings.workload, settings.value_size, difftime(mid1, start1));
+		fprintf(output, "\nThread: %d Workload: %c ValSize: %d Execution time for Running : %f", settings.num_threads, settings.workload, settings.value_size, difftime(end1, mid1));
+
+		fclose(output);
 
 		//TODO: to finish the experiment with each load/run, do not 
 		return retval;
