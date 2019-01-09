@@ -9,5 +9,5 @@ Driving Memcached with local file io instead of socket protocol.
 
 ## Usage
 
-./memcached -u root -B file -t [thread_num] -m 2048 -o hashpower=23
+./memcached -u root -B file -t [thread-num] -m 2048 -o hashpower=23 -w [workload] -z [value-size]
 
