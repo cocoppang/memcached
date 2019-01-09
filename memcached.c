@@ -4088,9 +4088,14 @@ stop:
         conn_release_items(c);
     }
     else {
-		//When the read completes, it jumps to process another requests
-        //conn_set_state(c, conn_mwrite);
-        conn_set_state(c, conn_read);
+		if(c->protocol == local_file_prot) {
+			//When the read completes, it jumps to process another requests
+			conn_set_state(c, conn_read);
+		}
+		else {
+			conn_set_state(c, conn_mwrite);
+		}
+
         c->msgcurr = 0;
     }
 }
