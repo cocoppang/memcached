@@ -50,6 +50,8 @@ pthread_mutex_t lru_locks[POWER_LARGEST];
 /* Connection lock around accepting new connections */
 pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
+pthread_barrier_t conn_barrier;
+
 #if !defined(HAVE_GCC_ATOMICS) && !defined(__sun)
 pthread_mutex_t atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
@@ -746,6 +748,10 @@ void memcached_thread_init_for_local_file_io(conn *c, int nthreads, void *arg) {
     pthread_cond_init(&init_cond, NULL);
 
     pthread_mutex_init(&cqi_freelist_lock, NULL);
+
+	//barrier initialization
+	pthread_barrier_init(&conn_barrier, NULL, nthreads);
+
     cqi_freelist = NULL;
 
     /* Want a wide lock table, but don't waste memory */
@@ -804,6 +810,13 @@ void memcached_thread_init_for_local_file_io(conn *c, int nthreads, void *arg) {
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;
+
+		// init per thread data structure
+		threads[i].l = logger_create();
+		threads[i].lru_bump_buf = item_lru_bump_buf_create();
+		if (threads[i].l == NULL || threads[i].lru_bump_buf == NULL) {
+			abort();
+		}
     }
 
 	c->thread = threads;

@@ -606,6 +606,19 @@ struct conn {
     char   *wcurr;
     int    wsize;
     int    wbytes;
+
+	/** For local file experiments **/
+	char ***inst;
+	char ***inst2;
+	int *inst_count;
+	int *inst_count2;
+
+	/** Duplicate these variables for each thread **/
+	void **item_t;
+	char **ritem_t;
+	int *cmd_t;
+	int *rlbytes_t;
+
     /** which state to go into after finishing current write */
     enum conn_states  write_and_go;
     void   *write_and_free; /** free this memory after finishing writing */
@@ -613,15 +626,7 @@ struct conn {
     char   *ritem;  /** when we read in an item's value, it goes here */
     int    rlbytes;
 
-
-	/** For local file experiments **/
-	char ***inst;
-	char ***inst2;
-	int *cur_inst_count;
-	int *cur_inst_count2;
-
     /* data for the nread state */
-
     /**
      * item is used to hold an item structure created after reading the command
      * line of set/add/replace commands, but before we finished reading the actual

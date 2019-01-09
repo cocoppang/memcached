@@ -104,7 +104,8 @@ static void conn_close(conn *c);
 static void conn_init(void);
 static bool update_event(conn *c, const int new_flags);
 static void complete_nread(conn *c);
-static void process_command(conn *c, char *command);
+//static void process_command(conn *c, char *command);
+static int process_command(conn *c, char *command, int thread_id);
 static void write_and_free(conn *c, char *buf, int bytes);
 static int ensure_iov_space(conn *c);
 static int add_iov(conn *c, const void *buf, int len);
@@ -130,7 +131,6 @@ conn **conns;
 time_t start1, end1, mid1;
 int set_size = 10000000;
 //int set_size = 500;
-bool run_flag = false;
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
@@ -331,6 +331,9 @@ static int add_msghdr(conn *c)
 }
 
 extern pthread_mutex_t conn_lock;
+
+//barrier
+extern pthread_barrier_t conn_barrier;
 
 /* Connection timeout thread bits */
 static pthread_t conn_timeout_tid;
@@ -1046,21 +1049,27 @@ static int add_iov(conn *c, const void *buf, int len) {
             len = leftover;
         } while (leftover > 0);
     } else {
-        /* Optimized path for TCP connections */
-        m = &c->msglist[c->msgused - 1];
-        if (m->msg_iovlen == IOV_MAX) {
-            add_msghdr(c);
-            m = &c->msglist[c->msgused - 1];
-        }
+		if(IS_FILE_PROTOCOL(c->protocol)) {
+			//TODO
+			return 0;
+		}
+		else {
+			/* Optimized path for TCP connections */
+			m = &c->msglist[c->msgused - 1];
+			if (m->msg_iovlen == IOV_MAX) {
+				add_msghdr(c);
+				m = &c->msglist[c->msgused - 1];
+			}
 
-        if (ensure_iov_space(c) != 0)
-            return -1;
+			if (ensure_iov_space(c) != 0)
+				return -1;
 
-        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
-        m->msg_iov[m->msg_iovlen].iov_len = len;
-        c->msgbytes += len;
-        c->iovused++;
-        m->msg_iovlen++;
+			m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
+			m->msg_iov[m->msg_iovlen].iov_len = len;
+			c->msgbytes += len;
+			c->iovused++;
+			m->msg_iovlen++;
+		}
     }
 
     return 0;
@@ -1184,10 +1193,9 @@ static void out_of_memory(conn *c, char *ascii_error) {
     }
 }
 
-
-static void complete_nread_file(conn *c) {
-	item *it = c->item;
-	int comm = c->cmd;
+static void complete_nread_file(conn *c, int thread_id) {
+	item *it = c->item_t[thread_id];
+	int comm = c->cmd_t[thread_id];
     enum store_item_type ret;
     bool is_valid = false;
 
@@ -1225,11 +1233,12 @@ static void complete_nread_file(conn *c) {
 		fprintf(stderr, "store error\n");
 	}
 
-    item_remove(c->item);       /* release the c->item reference */
-    c->item = 0;
+    item_remove(c->item_t[thread_id]);       /* release the c->item reference */
+    c->item_t[thread_id] = 0;
     
 	conn_set_state(c, conn_read);
 }
+
 /*
  * we get here after reading the value in set/add/replace commands. The command
  * has been stored in c->cmd, and the item is ready in c->item.
@@ -2795,7 +2804,7 @@ static void complete_nread(conn *c) {
         complete_nread_binary(c);
     }
 	else if(c->protocol == local_file_prot) {
-		complete_nread_file(c);
+		complete_nread_file(c, -1);
 	}
 }
 
@@ -4100,7 +4109,7 @@ stop:
     }
 }
 
-static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
+static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas, int thread_id) {
     char *key;
     size_t nkey;
     unsigned int flags;
@@ -4199,26 +4208,43 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
         return;
     }
-    ITEM_set_cas(it, req_cas_id);
-
-    c->item = it;
-#ifdef NEED_ALIGN
-    if (it->it_flags & ITEM_CHUNKED) {
-        c->ritem = ITEM_schunk(it);
-    } else {
-        c->ritem = ITEM_data(it);
-    }
-#else
-    c->ritem = ITEM_data(it);
-#endif
-    c->rlbytes = it->nbytes;
-    c->cmd = comm;
-
 
 	if(c->protocol == local_file_prot) {
+		ITEM_set_cas(it, req_cas_id);
+
+		c->item_t[thread_id] = it;
+#ifdef NEED_ALIGN
+		if (it->it_flags & ITEM_CHUNKED) {
+			c->ritem_t[thread_id] = ITEM_schunk(it);
+		} else {
+			c->ritem_t[thread_id] = ITEM_data(it);
+		}
+#else
+		c->ritem_t[thread_id] = ITEM_data(it);
+#endif
+		c->rlbytes_t[thread_id] = it->nbytes;
+		c->cmd_t[thread_id] = comm;
+
 		//just set the value to ritem (do not process unnecessary codes)
-		memcpy(c->ritem, tokens[2].value, tokens[2].length);
+		memcpy(c->ritem_t[thread_id], tokens[2].value, tokens[2].length);
+		c->rlbytes_t[thread_id] = 0;
 		c->rlbytes = 0;
+	}
+	else {
+		ITEM_set_cas(it, req_cas_id);
+
+		c->item = it;
+#ifdef NEED_ALIGN
+		if (it->it_flags & ITEM_CHUNKED) {
+			c->ritem = ITEM_schunk(it);
+		} else {
+			c->ritem = ITEM_data(it);
+		}
+#else
+		c->ritem = ITEM_data(it);
+#endif
+		c->rlbytes = it->nbytes;
+		c->cmd = comm;
 	}
 
     conn_set_state(c, conn_nread);
@@ -4739,7 +4765,8 @@ static void process_extstore_command(conn *c, token_t *tokens, const size_t ntok
 #endif
 
 /** Processing Commands **/
-static void process_command(conn *c, char *command) {
+//static void process_command(conn *c, char *command, int thread_id) {
+static int process_command(conn *c, char *command, int thread_id) {
 
     token_t tokens[MAX_TOKENS];
     size_t ntokens;
@@ -4762,7 +4789,7 @@ static void process_command(conn *c, char *command) {
     c->iovused = 0;
     if (add_msghdr(c) != 0) {
         out_of_memory(c, "SERVER_ERROR out of memory preparing response");
-        return;
+        return -1;
     }
 
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
@@ -4770,9 +4797,11 @@ static void process_command(conn *c, char *command) {
 	if(c->protocol == local_file_prot) {
 		if(strcmp(tokens[COMMAND_TOKEN].value, "GET") == 0) {
 			process_get_command(c, tokens, ntokens, false, false);
+			return 0;
 		}
 		else if(strcmp(tokens[COMMAND_TOKEN].value, "SET") == 0) {
-			process_update_command(c, tokens, ntokens, NREAD_SET, false);
+			process_update_command(c, tokens, ntokens, NREAD_SET, false, thread_id);
+			return 1;
 		}
 	}
 	else {
@@ -4789,11 +4818,11 @@ static void process_command(conn *c, char *command) {
 				 (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
 				 (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
 
-			process_update_command(c, tokens, ntokens, comm, false);
+			process_update_command(c, tokens, ntokens, comm, false, thread_id);
 
 		} else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
 
-			process_update_command(c, tokens, ntokens, comm, true);
+			process_update_command(c, tokens, ntokens, comm, true, thread_id);
 
 		} else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
 
@@ -4840,14 +4869,14 @@ static void process_command(conn *c, char *command) {
 			if (!settings.flush_enabled) {
 				// flush_all is not allowed but we log it on stats
 				out_string(c, "CLIENT_ERROR flush_all not allowed");
-				return;
+				return -1;
 			}
 
 			if (ntokens != (c->noreply ? 3 : 2)) {
 				exptime = strtol(tokens[1].value, NULL, 10);
 				if(errno == ERANGE) {
 					out_string(c, "CLIENT_ERROR bad command line format");
-					return;
+					return -1;
 				}
 			}
 
@@ -4871,7 +4900,7 @@ static void process_command(conn *c, char *command) {
 				settings.oldest_live = new_oldest;
 			}
 			out_string(c, "OK");
-			return;
+			return -1;
 
 		} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
 
@@ -4896,7 +4925,7 @@ static void process_command(conn *c, char *command) {
 
 				if (settings.slab_reassign == false) {
 					out_string(c, "CLIENT_ERROR slab reassignment disabled");
-					return;
+					return -1;
 				}
 
 				src = strtol(tokens[2].value, NULL, 10);
@@ -4904,7 +4933,7 @@ static void process_command(conn *c, char *command) {
 
 				if (errno == ERANGE) {
 					out_string(c, "CLIENT_ERROR bad command line format");
-					return;
+					return -1;
 				}
 
 				rv = slabs_reassign(src, dst);
@@ -4925,7 +4954,7 @@ static void process_command(conn *c, char *command) {
 						out_string(c, "SAME src and dst class are identical");
 						break;
 				}
-				return;
+				return -1;
 			} else if (ntokens >= 4 &&
 					(strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
 				process_slabs_automove_command(c, tokens, ntokens);
@@ -4937,7 +4966,7 @@ static void process_command(conn *c, char *command) {
 				int rv;
 				if (settings.lru_crawler == false) {
 					out_string(c, "CLIENT_ERROR lru crawler disabled");
-					return;
+					return -1;
 				}
 
 				rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL, 0,
@@ -4959,15 +4988,15 @@ static void process_command(conn *c, char *command) {
 						out_string(c, "ERROR an unknown error happened");
 						break;
 				}
-				return;
+				return -1;
 			} else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "metadump") == 0) {
 				if (settings.lru_crawler == false) {
 					out_string(c, "CLIENT_ERROR lru crawler disabled");
-					return;
+					return -1;
 				}
 				if (!settings.dump_enabled) {
 					out_string(c, "ERROR metadump not allowed");
-					return;
+					return -1;
 				}
 
 				int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
@@ -4992,29 +5021,29 @@ static void process_command(conn *c, char *command) {
 						out_string(c, "ERROR an unknown error happened");
 						break;
 				}
-				return;
+				return -1;
 			} else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "tocrawl") == 0) {
 				uint32_t tocrawl;
 				if (!safe_strtoul(tokens[2].value, &tocrawl)) {
 					out_string(c, "CLIENT_ERROR bad command line format");
-					return;
+					return -1;
 				}
 				settings.lru_crawler_tocrawl = tocrawl;
 				out_string(c, "OK");
-				return;
+				return -1;
 			} else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "sleep") == 0) {
 				uint32_t tosleep;
 				if (!safe_strtoul(tokens[2].value, &tosleep)) {
 					out_string(c, "CLIENT_ERROR bad command line format");
-					return;
+					return -1;
 				}
 				if (tosleep > 1000000) {
 					out_string(c, "CLIENT_ERROR sleep must be one second or less");
-					return;
+					return -1;
 				}
 				settings.lru_crawler_sleep = tosleep;
 				out_string(c, "OK");
-				return;
+				return -1;
 			} else if (ntokens == 3) {
 				if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "enable") == 0)) {
 					if (start_item_crawler_thread() == 0) {
@@ -5031,7 +5060,7 @@ static void process_command(conn *c, char *command) {
 				} else {
 					out_string(c, "ERROR");
 				}
-				return;
+				return -1;
 			} else {
 				out_string(c, "ERROR");
 			}
@@ -5060,7 +5089,7 @@ static void process_command(conn *c, char *command) {
 			}
 		}
 	}
-    return;
+    return -1;
 }
 
 
@@ -5157,22 +5186,22 @@ static int try_read_command(conn *c) {
 		//process commands
 		//process_command(c, c->inst[c->thread->thread_id][c->cur_inst_count[c->thread->thread_id]]);
 
-		if(c->cur_inst_count[0] == set_size && run_flag == false) {
-			mid1 = time(0);
-			run_flag = true;
-		}
-		else if(c->cur_inst_count2[0] == set_size && run_flag == true) {
-			return -1;
-		}
+		//if(c->cur_inst_count[0] == set_size && run_flag == false) {
+		//	mid1 = time(0);
+		//	run_flag = true;
+		//}
+		//else if(c->cur_inst_count2[0] == set_size && run_flag == true) {
+		//	return -1;
+		//}
 
-		if(run_flag == true) {
-			process_command(c, c->inst2[0][c->cur_inst_count2[0]]);
-			c->cur_inst_count2[0]++;
-		}
-		else if(run_flag == false) {
-			process_command(c, c->inst[0][c->cur_inst_count[0]]);
-			c->cur_inst_count[0]++;
-		}
+		//if(run_flag == true) {
+		//	process_command(c, c->inst2[0][c->cur_inst_count2[0]]);
+		//	c->cur_inst_count2[0]++;
+		//}
+		//else if(run_flag == false) {
+		//	process_command(c, c->inst[0][c->cur_inst_count[0]]);
+		//	c->cur_inst_count[0]++;
+		//}
 		
 	}
 	else {
@@ -5212,7 +5241,7 @@ static int try_read_command(conn *c) {
         assert(cont <= (c->rcurr + c->rbytes));
 
         c->last_cmd_time = current_time;
-        process_command(c, c->rcurr);
+        process_command(c, c->rcurr, -1);
 
         c->rbytes -= (cont - c->rcurr);
         c->rcurr = cont;
@@ -5237,15 +5266,16 @@ static enum try_read_result try_read_file(conn *c) {
 	FILE *f;
 	FILE *f2;
 	int thread_id;
+	char filename[70];
 
     
 	assert(c != NULL);
 	
 	c->inst = (char***)malloc(sizeof(char**)*settings.num_threads);
-	c->cur_inst_count = (int*)malloc(sizeof(int)*settings.num_threads);
+	c->inst_count = (int*)malloc(sizeof(int)*settings.num_threads);
 
 	for(i = 0; i < settings.num_threads;i++) {
-		c->cur_inst_count[i] = 0;
+		c->inst_count[i] = 0;
 		c->inst[i] = (char**)malloc(sizeof(char*)*set_size);
 		for(j = 0; j < set_size;j++) {
 			c->inst[i][j] = (char*)malloc(sizeof(char)*BUF_SIZE);
@@ -5253,24 +5283,25 @@ static enum try_read_result try_read_file(conn *c) {
 	}
 
 	c->inst2 = (char***)malloc(sizeof(char**)*settings.num_threads);
-	c->cur_inst_count2 = (int*)malloc(sizeof(int)*settings.num_threads);
+	c->inst_count2 = (int*)malloc(sizeof(int)*settings.num_threads);
 
 	for(i = 0; i < settings.num_threads;i++) {
-		c->cur_inst_count2[i] = 0;
+		c->inst_count2[i] = 0;
 		c->inst2[i] = (char**)malloc(sizeof(char*)*set_size);
 		for(j = 0; j < set_size;j++) {
 			c->inst2[i][j] = (char*)malloc(sizeof(char)*BUF_SIZE);
 		}
 	}
 
-	if(c->inst == NULL || c->cur_inst_count == NULL || 
-			c->inst2 == NULL || c->cur_inst_count2 == NULL) 
+	if(c->inst == NULL || c->inst_count == NULL || 
+			c->inst2 == NULL || c->inst_count2 == NULL) 
 		return READ_MEMORY_ERROR;
 
 	f = fdopen(c->sfd, "r");
 	i = 0;
 	while(i < set_size) {
 		if(fgets(buf, BUF_SIZE, f) == NULL) {
+			fprintf(stderr, "load file read error\n");
 			return READ_NO_DATA_RECEIVED;
 		}
 		buf[strlen(buf)-1] = 0;
@@ -5280,16 +5311,19 @@ static enum try_read_result try_read_file(conn *c) {
 		memcpy(key, tok, strlen(tok));
 
 		//single thread
-		thread_id = 0;
-		memcpy(c->inst[thread_id][i++], buf2, BUF_SIZE);
+		thread_id = hash(key, strlen(key))%settings.num_threads;
+		memcpy(c->inst[thread_id][c->inst_count[thread_id]++], buf2, BUF_SIZE);
+		i++;
 		
 	}
 
-	f2 = fopen("/home/workloads/workload_16B_16B/tracea_run_a_m.txt","r");
-	//f2 = fopen("/home/workloads/tracea_run_simple.txt","r");
+	sprintf(filename, "/home/workloads/workload_16B_16B/tracea_run_a_m.txt");
+	f2 = fopen(filename,"r");
+
 	i = 0;
 	while(i < set_size) {
 		if(fgets(buf, BUF_SIZE, f2) == NULL) {
+			fprintf(stderr, "run file read error\n");
 			return READ_NO_DATA_RECEIVED;
 		}
 		buf[strlen(buf)-1] = 0;
@@ -5299,10 +5333,12 @@ static enum try_read_result try_read_file(conn *c) {
 		memcpy(key, tok, strlen(tok));
 
 		//single thread
-		thread_id = 0;
-		memcpy(c->inst2[thread_id][i++], buf2, BUF_SIZE);
+		thread_id = hash(key, strlen(key))%settings.num_threads;
+		memcpy(c->inst2[thread_id][c->inst_count2[thread_id]++], buf2, BUF_SIZE);
+		i++;
 		
 	}
+	
 	fclose(f2);
 
 	return READ_DATA_RECEIVED;
@@ -6825,20 +6861,52 @@ static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
 
 void* local_file_worker_thread(void* arg) {
 
-	conn* c = arg;
-	LIBEVENT_THREAD* thread = c->thread;
+	int thread_id = *(int*)arg;
+	bool complete_flag = false;
+	bool run_flag = false;
+	int cur_inst_count = 0;
+	int cur_inst_count2 = 0;
+	int comm = -1;
 
-	thread->l = logger_create();
-	thread->lru_bump_buf = item_lru_bump_buf_create();
-	if(thread->l == NULL || thread->lru_bump_buf == NULL) {
-		abort();
+	//fprintf(stdout, "thread id : %d, complete_flag : %d\n", thread_id, complete_flag == true ? 1:0);
+	while(!complete_flag) {
+		if(cur_inst_count == listen_conn->inst_count[thread_id] && run_flag == false) {
+			pthread_barrier_wait(&conn_barrier);
+			if(thread_id == 0) {
+				mid1 = time(0);
+			}
+			run_flag = true;
+		}
+		else if(cur_inst_count2 == listen_conn->inst_count2[thread_id] && run_flag == true) {
+			complete_flag = true;
+			break;
+		}
+
+		if(run_flag == true) {
+			comm = process_command(listen_conn, listen_conn->inst2[thread_id][cur_inst_count2], thread_id);
+			if(comm == 1) {
+				complete_nread_file(listen_conn, thread_id);
+			}
+			else if(comm == -1) {
+				assert(0);
+			}
+			cur_inst_count2++;
+		}
+		else if(run_flag == false) {
+			comm = process_command(listen_conn, listen_conn->inst[thread_id][cur_inst_count], thread_id);
+			if(comm == 1) {
+				complete_nread_file(listen_conn, thread_id);
+			}
+			else if(comm == -1) {
+				assert(0);
+			}
+			cur_inst_count++;
+		}
 	}
-	if(settings.drop_privileges) {
-		drop_worker_privileges();
-	}
+
 	//register_thread_initialized();
 	
-	drive_machine(listen_conn);
+	//drive_machine(listen_conn);
 
 	return NULL;
 }
@@ -8120,13 +8188,23 @@ int main (int argc, char **argv) {
 	else {
 		try_read_file(listen_conn);
 		fprintf(stdout, "READ file done\n");
+
+		//TODO should move other functions
+		listen_conn->item_t = (void**)malloc(sizeof(void*)*settings.num_threads);
+		listen_conn->ritem_t = (char**)malloc(sizeof(char*)*settings.num_threads);
+		listen_conn->cmd_t = (int*)malloc(sizeof(int)*settings.num_threads);
+		listen_conn->rlbytes_t = (int*)malloc(sizeof(int)*settings.num_threads);
+
     	memcached_thread_init_for_local_file_io(listen_conn, settings.num_threads, NULL);
 		int i;
 		int status;
 
+		int* id = (int*)malloc(sizeof(int)*settings.num_threads);
+
 		start1 = time(0);
 		for(i = 0; i < settings.num_threads; i++) {
-			pthread_create(&listen_conn->thread[i].thread_id, NULL, local_file_worker_thread, (void*)listen_conn);
+			id[i] = i;
+			pthread_create(&listen_conn->thread[i].thread_id, NULL, local_file_worker_thread, (void*)&id[i]);
 		}
 
 		for(i = 0; i < settings.num_threads;i++) {
