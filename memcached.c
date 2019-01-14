@@ -131,7 +131,7 @@ conn **conns;
 time_t start1, end1, mid1;
 int set_size = 10000000;
 int set_size2 = 10000000;
-int set_jitter_size = 100000;
+int set_jitter_size = 1000000;
 //int set_size = 500;
 
 struct slab_rebalance slab_rebal;
@@ -5291,7 +5291,7 @@ static enum try_read_result try_read_file(conn *c) {
 	for(i = 0; i < settings.num_threads;i++) {
 		c->inst_count[i] = 0;
 		c->inst[i] = (char**)malloc(sizeof(char*)*(set_size/settings.num_threads + set_jitter_size));
-		for(j = 0; j < set_size/settings.num_threads + set_jitter_size;j++) {
+		for(j = 0; j < (set_size/settings.num_threads + set_jitter_size);j++) {
 			c->inst[i][j] = (char*)malloc(sizeof(char)*settings.buffer_size);
 		}
 	}
@@ -5302,7 +5302,7 @@ static enum try_read_result try_read_file(conn *c) {
 	for(i = 0; i < settings.num_threads;i++) {
 		c->inst_count2[i] = 0;
 		c->inst2[i] = (char**)malloc(sizeof(char*)*(set_size2/settings.num_threads + set_jitter_size));
-		for(j = 0; j < set_size2/settings.num_threads + set_jitter_size;j++) {
+		for(j = 0; j < (set_size2/settings.num_threads + set_jitter_size);j++) {
 			c->inst2[i][j] = (char*)malloc(sizeof(char)*settings.buffer_size);
 		}
 	}
